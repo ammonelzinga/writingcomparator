@@ -2,12 +2,35 @@ const supabase = require('../../lib/supabaseClient');
 const { generateText } = require('../../lib/openai');
 
 function sanitizeSql(sql) {
-  // Very basic: allow only SELECT and LIMIT, prevent writes
-  const lowered = sql.trim().toLowerCase();
-  if (!lowered.startsWith('select')) throw new Error('Only SELECT queries are allowed');
-  if (lowered.includes('insert') || lowered.includes('update') || lowered.includes('delete') || lowered.includes('drop') || lowered.includes('alter')) {
-    throw new Error('Query contains disallowed statements');
+  // Allow an optional sequence of safe SET statements at the start (e.g. `SET ivfflat.probes = 10;`) followed by a single SELECT.
+  // Disallow any write/DDL statements anywhere and disallow additional statements after the SELECT.
+  if (!sql || typeof sql !== 'string') throw new Error('Invalid SQL');
+  const trimmed = sql.trim();
+
+  // Strip any leading SET ...; statements (one or more)
+  const leadingSetRegex = /^(?:\s*SET\s+[^;]+;\s*)+/i;
+  let rest = trimmed;
+  if (leadingSetRegex.test(rest)) {
+    rest = rest.replace(leadingSetRegex, '').trim();
   }
+
+  if (!rest.toLowerCase().startsWith('select')) {
+    throw new Error('Only a single SELECT query (optionally preceded by SET statements) is allowed');
+  }
+
+  // After removing leading SETs, we should not have any additional semicolons (i.e., multiple statements)
+  if (rest.includes(';')) {
+    throw new Error('Multiple statements are not allowed after the SELECT');
+  }
+
+  // Disallow dangerous keywords anywhere in the SQL (case-insensitive)
+  const forbidden = ['insert', 'update', 'delete', 'drop', 'alter', 'create', 'truncate', 'grant', 'revoke', 'vacuum', 'copy', 'merge'];
+  const loweredRest = rest.toLowerCase();
+  for (const kw of forbidden) {
+    const pattern = new RegExp('\\b' + kw + '\\b', 'i');
+    if (pattern.test(loweredRest)) throw new Error('Query contains disallowed statements');
+  }
+
   return sql;
 }
 
@@ -36,7 +59,8 @@ export default async function handler(req, res) {
   // For theme-based queries, use the theme and passage_theme tables and their embedding vectors.
   // When comparing estimated_date numerically, cast it appropriately.
   // Write a single SELECT SQL statement (or call the search_passages_by_embedding RPC) that answers: ${question}. Only return the SQL statement.
-  const prompt = `You are given a Postgres database with tables: document(document_id,title,author,tradition,rhetoric_type,language,estimated_date,notes), overview(overview_id,document_id,label,summary), passage(passage_id,document_id,overview_id,label,content), theme(theme_id,name,description,embedding_vector), passage_theme(passage_id,theme_id,score), overview_theme(overview_id,theme_id,score), embedding_passage(passage_id,embedding_vector), embedding_overview(overview_id,embedding_vector). The database supports semantic similarity search using the embedding_vector columns and the search_passages_by_embedding RPC. For theme-based queries, use the theme and passage_theme tables and their embedding vectors. When comparing estimated_date numerically, cast it appropriately. Write a single SELECT SQL statement (or call the search_passages_by_embedding RPC) that answers: ${question}. Only return the SQL statement.`;
+  const prompt = `You are given a Postgres database with tables: document(document_id,title,author,tradition,rhetoric_type,language,estimated_date,notes), overview(overview_id,document_id,label,summary), passage(passage_id,document_id,overview_id,label,content), theme(theme_id,name,description,embedding_vector), passage_theme(passage_id,theme_id,score), overview_theme(overview_id,theme_id,score), embedding_passage(passage_id,embedding_vector), embedding_overview(overview_id,embedding_vector). 
+  The database supports semantic similarity search using the embedding_vector columns and the search_passages_by_embedding RPC. For theme-based queries, use the theme and passage_theme tables and their embedding vectors. When comparing estimated_date numerically, cast it appropriately. Write a single SELECT SQL statement (or call the search_passages_by_embedding RPC) that answers: ${question}. If using embedding, make sure to SET ivfflat.probes = 10, and select specific columns and setting a limit with the correct ordery by embedding syntax. If someone asks for passages that have this "..." the passage doesn't need to have the exact phrase, simply similar things. Only return the SQL statement.`;
   let sql;
   let finalSql = null;
   try {
@@ -48,7 +72,8 @@ export default async function handler(req, res) {
     finalSql = finalSql.replace(/^`+|`+$/g, '').trim();
     // remove trailing semicolon for safety
     finalSql = finalSql.replace(/;\s*$/, '').trim();
-    finalSql = sanitizeSql(finalSql);
+  // Validate SQL using the sanitizer (allows leading SET statements) before execution
+  finalSql = sanitizeSql(finalSql);
   } catch (e) {
     console.error('SQL generation/sanitization failed', e.message, { sql });
     return res.status(400).json({ error: 'SQL generation or sanitization failed', message: e.message, sql: finalSql || sql || null });
@@ -68,8 +93,53 @@ export default async function handler(req, res) {
   }
 
   try {
+    // If there are leading SET statements, convert them into a single-statement CTE
+    // using set_config so the execute_sql RPC (which forbids semicolons) can run the query.
+    let transformedSql = finalSql;
+    try {
+      const sets = [];
+      let tmp = transformedSql;
+      // consume leading SET statements
+      while (/^\s*SET\b/i.test(tmp)) {
+        const idx = tmp.indexOf(';');
+        if (idx === -1) break;
+        const stmt = tmp.slice(0, idx + 1);
+        tmp = tmp.slice(idx + 1);
+        // extract name and value
+        const body = stmt.replace(/^\s*SET\s+/i, '').replace(/;\s*$/, '').trim();
+        const eq = body.indexOf('=');
+        if (eq === -1) continue; // skip malformed
+        let name = body.slice(0, eq).trim();
+        let val = body.slice(eq + 1).trim();
+        // remove optional surrounding quotes from value
+        if ((val.startsWith("'") && val.endsWith("'")) || (val.startsWith('"') && val.endsWith('"'))) {
+          val = val.slice(1, -1);
+        }
+        // escape single quotes
+        val = val.replace(/'/g, "''");
+        name = name.replace(/'/g, "''");
+        sets.push({ name, val });
+      }
+      if (sets.length > 0) {
+        // tmp now holds the remainder after leading SETs
+        const remainder = tmp.trim();
+        if (!/^select\b/i.test(remainder)) {
+          throw new Error('Only a SELECT is allowed after SET statements');
+        }
+        // Build a SELECT wrapper that executes set_config(...) in a subselect and cross-joins with the real SELECT.
+        // This ensures the final statement begins with SELECT (which execute_sql requires) and avoids semicolons.
+        const cfgList = sets.map((s, i) => `set_config('${s.name}', '${s.val}', true) as __set${i}`).join(', ');
+        transformedSql = `SELECT t.* FROM (SELECT ${cfgList}) __cfg, (${remainder}) t`;
+      }
+    } catch (e) {
+      // if transformation fails, fall back to original SQL
+      transformedSql = finalSql;
+    }
+
     // pass the parameter name p_sql to match the function signature
-    const { data, error } = await supabase.rpc('execute_sql', { p_sql: finalSql });
+    let data, error;
+    // Use the safe RPC by default
+    ({ data, error } = await supabase.rpc('execute_sql', { p_sql: transformedSql }));
     // NOTE: If execute_sql rpc doesn't exist, fallback to running via supabase.from
     if (error) {
       // Try raw query via PostgREST - select from a function isn't available; return error
