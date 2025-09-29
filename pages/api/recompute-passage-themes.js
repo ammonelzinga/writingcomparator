@@ -32,8 +32,11 @@ export default async function handler(req, res) {
 
       const upserts = [];
       for (const p of passages) {
+        if (!p || !p.embedding_vector) continue;
         for (const th of themes) {
-          const score = cosine(p.embedding_vector, th.embedding_vector);
+          if (!th || !th.embedding_vector) continue;
+          let score = cosine(p.embedding_vector, th.embedding_vector);
+          if (!Number.isFinite(score)) score = 0;
           upserts.push({ passage_id: p.passage_id, theme_id: th.theme_id, score });
         }
       }
@@ -60,16 +63,20 @@ export default async function handler(req, res) {
 
       const upserts = [];
       for (const p of passages) {
+        if (!p || !p.embedding_vector) continue;
         for (const th of themes) {
-          const score = cosine(p.embedding_vector, th.embedding_vector);
+          if (!th || !th.embedding_vector) continue;
+          let score = cosine(p.embedding_vector, th.embedding_vector);
+          if (!Number.isFinite(score)) score = 0;
           upserts.push({ passage_id: p.passage_id, theme_id: th.theme_id, score });
         }
       }
 
       // upsert in chunks (avoid huge single requests)
       for (let i = 0; i < upserts.length; i += 500) {
-        const slice = upserts.slice(i, i + 500);
-        const { error: uErr } = await supabase.from('passage_theme').upsert(slice);
+  const slice = upserts.slice(i, i + 500);
+  for (const row of slice) if (!Number.isFinite(row.score)) row.score = 0;
+  const { error: uErr } = await supabase.from('passage_theme').upsert(slice);
         if (uErr) {
           console.error('upsert error', uErr);
           upsertErrors.push(uErr);

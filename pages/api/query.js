@@ -14,14 +14,12 @@ function sanitizeSql(sql) {
     rest = rest.replace(leadingSetRegex, '').trim();
   }
 
-  if (!rest.toLowerCase().startsWith('select')) {
-    throw new Error('Only a single SELECT query (optionally preceded by SET statements) is allowed');
+  const lowerRest = rest.toLowerCase();
+  if (!(lowerRest.startsWith('select') || lowerRest.startsWith('with'))) {
+    throw new Error('Only a single SELECT query or a WITH (CTE) + SELECT (optionally preceded by SET statements) is allowed');
   }
 
-  // After removing leading SETs, we should not have any additional semicolons (i.e., multiple statements)
-  if (rest.includes(';')) {
-    throw new Error('Multiple statements are not allowed after the SELECT');
-  }
+  // Allow semicolons/multiple statements (we'll try to execute and return rows when possible)
 
   // Disallow dangerous keywords anywhere in the SQL (case-insensitive)
   const forbidden = ['insert', 'update', 'delete', 'drop', 'alter', 'create', 'truncate', 'grant', 'revoke', 'vacuum', 'copy', 'merge'];
@@ -59,8 +57,91 @@ export default async function handler(req, res) {
   // For theme-based queries, use the theme and passage_theme tables and their embedding vectors.
   // When comparing estimated_date numerically, cast it appropriately.
   // Write a single SELECT SQL statement (or call the search_passages_by_embedding RPC) that answers: ${question}. Only return the SQL statement.
-  const prompt = `You are given a Postgres database with tables: document(document_id,title,author,tradition,rhetoric_type,language,estimated_date,notes), overview(overview_id,document_id,label,summary), passage(passage_id,document_id,overview_id,label,content), theme(theme_id,name,description,embedding_vector), passage_theme(passage_id,theme_id,score), overview_theme(overview_id,theme_id,score), embedding_passage(passage_id,embedding_vector), embedding_overview(overview_id,embedding_vector). 
-  The database supports semantic similarity search using the embedding_vector columns and the search_passages_by_embedding RPC. For theme-based queries, use the theme and passage_theme tables and their embedding vectors. When comparing estimated_date numerically, cast it appropriately. Write a single SELECT SQL statement (or call the search_passages_by_embedding RPC) that answers: ${question}. If using embedding, make sure to SET ivfflat.probes = 10, and select specific columns and setting a limit with the correct ordery by embedding syntax. If someone asks for passages that have this "..." the passage doesn't need to have the exact phrase, simply similar things. Only return the SQL statement.`;
+  const prompt = `You are given a Postgres database set up like this: 
+
+        CREATE EXTENSION IF NOT EXISTS vector;
+
+create table if not exists document (
+    document_id serial primary key,
+    title text not null,
+    author text,
+    tradition text,
+    rhetoric_type text,
+    language text,
+    estimated_date text,
+    notes text
+);
+
+create table if not exists overview (
+    overview_id serial primary key,
+    document_id int references document(document_id) on delete cascade,
+    label text not null,
+    summary text not null,
+    unique(document_id, label)
+);
+
+create table if not exists passage (
+    passage_id serial primary key,
+    document_id int references document(document_id) on delete cascade,
+    overview_id int references overview(overview_id) on delete cascade,
+    label text not null,
+    content text not null,
+    unique(document_id, label)
+);
+
+create table if not exists embedding_overview (
+    overview_id int primary key references overview(overview_id) on delete cascade,
+    embedding_vector vector(1536) not null
+);
+
+create index if not exists embedding_overview_idx on embedding_overview using ivfflat (embedding_vector vector_cosine_ops) with (lists = 100);
+
+create table if not exists embedding_passage (
+    passage_id int primary key references passage(passage_id) on delete cascade,
+    embedding_vector vector(1536) not null
+);
+
+create index if not exists embedding_passage_idx on embedding_passage using ivfflat (embedding_vector vector_cosine_ops) with (lists = 100);
+
+create table if not exists theme (
+    theme_id serial primary key,
+    name text not null unique,
+    description text,
+    embedding_vector vector(1536)
+);
+
+create index if not exists theme_embedding_idx on theme using ivfflat (embedding_vector vector_cosine_ops) with (lists = 50);
+
+create table if not exists passage_theme (
+    passage_id int references passage(passage_id) on delete cascade,
+    theme_id int references theme(theme_id) on delete cascade,
+    score real,
+    primary key (passage_id, theme_id)
+);
+
+create table if not exists overview_theme (
+    overview_id int references overview(overview_id) on delete cascade,
+    theme_id int references theme(theme_id) on delete cascade,
+    score real,
+    primary key (overview_id, theme_id)
+);
+
+create index if not exists passage_theme_theme_idx on passage_theme(theme_id);
+create index if not exists overview_theme_theme_idx on overview_theme(theme_id);
+
+An example of the Documents data is: 
+    title: "Genesis"
+    author: "KJV"
+    tradition: "Christian, Jewish"
+    rhetoric_type: "Narrative"
+    language: "English"
+    estimated_date: "1000 BC"
+    notes: "First book of the Bible"
+
+   Write a postgtres SQL statement (or call the search_passages_by_embedding RPC) that answers: ${question}. 
+  Only return the SQL statement.`;
+
+
   let sql;
   let finalSql = null;
   try {
@@ -156,7 +237,7 @@ export default async function handler(req, res) {
       }
       return res.status(400).json({ error: 'Execution failed', details: error, sql: finalSql, hint });
     }
-    const summary = await generateText(`Summarize these results in a friendly way for a user:\n\n${JSON.stringify(data).slice(0,2000)}`);
+    const summary = await generateText(`Answer this question ${question} entirely based on the results:\n\n${JSON.stringify(data).slice(0,2000)}`);
     const resp = { sql: finalSql, data, summary };
     // diagnostics: include count and sample for easier frontend debugging
     try {

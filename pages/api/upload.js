@@ -108,14 +108,19 @@ async function computePassageThemeScores(passageIds) {
     const { cosine } = require('../../lib/vector');
     const upserts = [];
     for (const p of passages) {
+      if (!p || !p.embedding_vector) continue;
       for (const t of themes) {
-        const score = cosine(p.embedding_vector, t.embedding_vector);
+        if (!t || !t.embedding_vector) continue;
+        let score = cosine(p.embedding_vector, t.embedding_vector);
+        if (!Number.isFinite(score)) score = 0;
         upserts.push({ passage_id: p.passage_id, theme_id: t.theme_id, score });
       }
     }
 
     for (let i = 0; i < upserts.length; i += 500) {
       const slice = upserts.slice(i, i + 500);
+      // ensure no null scores in slice
+      for (const row of slice) if (!Number.isFinite(row.score)) row.score = 0;
       const { error } = await supabase.from('passage_theme').upsert(slice);
       if (error) console.error('passage_theme upsert error', error);
     }

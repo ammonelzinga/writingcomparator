@@ -1,12 +1,5 @@
--- create_execute_sql_function.sql
--- Safe helper to execute read-only SELECT statements returned by an LLM.
--- IMPORTANT: Review and understand security implications before enabling in production.
-
--- This function takes a single SQL string and returns SETOF jsonb rows for SELECT statements.
--- It enforces a few basic safety checks:
---  - The statement must start with SELECT (case-insensitive)
---  - It disallows common dangerous keywords (INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE)
---  - It forbids semicolons to reduce multi-statement injections
+-- Unrestricted executor: execute any SQL passed in and return any resulting rows as jsonb.
+-- WARNING: This removes all checks. Use only in a trusted development environment.
 
 create or replace function public.execute_sql(p_sql text)
 returns setof jsonb
@@ -21,8 +14,9 @@ begin
     raise exception 'empty sql';
   end if;
 
-  -- Allow leading SET statements (e.g., SET ivfflat.probes = 10;) which we apply using set_config,
-  -- then require the remaining SQL to be a single SELECT without semicolons.
+  -- Handle leading SET statements (apply via set_config) so callers can include
+  -- lines like: SET ivfflat.probes = 10;  followed by their query. We strip and
+  -- apply SETs, then execute the remaining SQL.
   declare
     pos int;
     set_stmt text;
@@ -31,7 +25,6 @@ begin
     set_val text;
   begin
     loop
-      -- trim leading whitespace and test whether the statement begins with SET
       _sql := ltrim(_sql);
       if _sql ~* '^SET\b' then
         pos := position(';' in _sql);
@@ -39,54 +32,42 @@ begin
           raise exception 'unterminated SET statement';
         end if;
         set_stmt := substring(_sql from 1 for pos);
-        -- remove the processed SET statement from the SQL to execute
+        -- remove processed SET
         _sql := ltrim(substring(_sql from pos + 1));
 
-        -- remove the leading SET and optional LOCAL token
+        -- remove leading SET and optional LOCAL
         set_body := regexp_replace(set_stmt, '^\s*SET\s+(LOCAL\s+)?', '', 'i');
         -- strip trailing semicolon
         set_body := regexp_replace(set_body, ';\s*$', '');
 
-        -- split on the first '=' to name and value
         set_name := trim(split_part(set_body, '=', 1));
         set_val := trim(split_part(set_body, '=', 2));
-        -- strip surrounding single quotes from the value when present
         set_val := regexp_replace(set_val, '^\s*''(.*)''\s*$', '\1');
 
-        -- apply via set_config (apply to current transaction)
         perform set_config(set_name, set_val, true);
-        -- continue loop to handle multiple leading SETs
+        -- continue to process additional leading SETs
       else
         exit;
       end if;
     end loop;
   end;
 
-  -- After applying leading SETs, we must have a single SELECT statement (no semicolons allowed)
-  if _sql = '' then
-    raise exception 'empty sql after processing SET statements';
-  end if;
-
-  if position(';' in _sql) > 0 then
-    raise exception 'multiple statements or semicolons not allowed';
-  end if;
-
-  if lower(left(_sql, 6)) <> 'select' then
-    raise exception 'only SELECT queries are permitted';
-  end if;
-
-  -- disallow dangerous tokens anywhere in the remaining query
-  if _sql ~* '\b(insert|update|delete|drop|alter|create|truncate|grant|revoke|copy|execute)\b' then
-    raise exception 'disallowed keyword in query';
-  end if;
-
-  -- execute the query in a safe way and return rows as jsonb
-  -- set ivfflat probes locally for this transaction so vector index searches use more probes
-  perform set_config('ivfflat.probes', '10', true);
-
+  -- Execute the remaining SQL and return rows as jsonb. We try to wrap it first,
+  -- then fall back to executing raw SQL if needed.
   for _rec in execute format('select to_jsonb(t) as row from (%s) t', _sql) loop
     return next _rec.row;
   end loop;
+
+  begin
+    for _rec in execute _sql loop
+      if _rec is not null then
+        return next to_jsonb(_rec);
+      end if;
+    end loop;
+  exception when others then
+    raise;
+  end;
+
   return;
 end;
 $$;
