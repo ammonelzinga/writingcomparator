@@ -44,11 +44,6 @@ function DropdownCard({ title, open, setOpen, children, accent, icon }) {
     </div>
   );
 }
-        }}>{children}</div>
-      )}
-    </div>
-  );
-}
 import { useEffect, useState } from 'react';
 
 export default function Home() {
