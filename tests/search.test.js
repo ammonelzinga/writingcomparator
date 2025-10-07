@@ -5,7 +5,11 @@ jest.mock('../lib/openai', () => ({
 jest.mock('../lib/supabaseClient', () => ({
   rpc: jest.fn(async (name, params) => {
     if (name === 'execute_sql') return { data: [{ passage_id: 1, content: 'x' }], error: null };
-    if (name === 'search_passages_by_embedding') return { data: [{ passage_id: 2, content: 'y', score: 0.9 }], error: null };
+    if (name === 'search_passages_by_embedding') {
+      // basic shape check for new signature
+      if (!params || !params.query_embedding) return { data: [], error: { message: 'missing query_embedding' } };
+      return { data: [{ passage_id: 2, content: 'y', similarity: 0.91 }], error: null };
+    }
     return { data: [], error: null };
   }),
 }));

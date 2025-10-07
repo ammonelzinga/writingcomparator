@@ -7,8 +7,10 @@ export default async function handler(req, res) {
   const q = body.q || '';
   const mode = body.mode || 'text';
   const limit = Math.min(100, parseInt(body.limit || 10, 10));
-  const offset = parseInt(body.offset || 0, 10);
-  const document_id = body.document_id || null;
+  const offset = parseInt(body.offset || 0, 10); // unused with new RPC but retained for compatibility
+  const document_id = body.document_id || null; // backward compatibility
+  const theme_filter = body.theme || body.theme_filter || null;
+  const document_filter = body.document || body.document_filter || null;
 
   if (!q) return res.status(400).json({ error: 'q required' });
 
@@ -25,15 +27,15 @@ export default async function handler(req, res) {
 
     // vector mode: create embedding and do approximate search via Postgres RPC
     const emb = await createEmbedding(q);
-    // Call a dedicated RPC that accepts the embedding array as a parameter to avoid SQL injection
+    // New hybrid RPC signature: (query_embedding, match_limit, theme_filter, document_filter)
     const { data, error } = await supabase.rpc('search_passages_by_embedding', {
-      p_embedding: emb,
-      p_limit: limit,
-      p_offset: offset,
-      p_document_id: document_id,
+      query_embedding: emb,
+      match_limit: limit,
+      theme_filter,
+      document_filter: document_filter || (document_id ? String(document_id) : null),
     });
-    if (error) return res.status(500).json({ error });
-    return res.json({ results: data });
+    if (error) return res.status(500).json({ error, mode: 'vector' });
+    return res.json({ results: data, mode: 'vector' });
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }

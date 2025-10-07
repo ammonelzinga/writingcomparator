@@ -1,94 +1,93 @@
 const supabase = require('../../lib/supabaseClient');
-const { cosine } = require('../../lib/vector');
+const { cosine, coerce } = require('../../lib/vector');
 
-// Batch size for passage processing
 const BATCH_SIZE = 200;
+const DEFAULT_TOP_N = 8;
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).end();
-  const document_id = req.body && req.body.document_id ? req.body.document_id : null;
+  const document_id = req.body?.document_id || null;
+  const topN = parseInt(req.body?.top_n, 10) || DEFAULT_TOP_N;
+  const reset = !!req.body?.reset; // if true, delete existing rows first
 
   try {
-    // fetch all themes with embeddings
+    if (reset) {
+      if (document_id) {
+        // delete passage_theme rows for passages of this document
+        const { data: passIds, error: pidErr } = await supabase.from('passage').select('passage_id').eq('document_id', document_id);
+        if (pidErr) return res.status(500).json({ error: pidErr });
+        const ids = (passIds || []).map(r => r.passage_id);
+        if (ids.length) {
+          // Supabase delete with in filter
+          const { error: delErr } = await supabase.from('passage_theme').delete().in('passage_id', ids);
+          if (delErr) return res.status(500).json({ error: delErr });
+        }
+      } else {
+        const { error: delAllErr } = await supabase.from('passage_theme').delete().neq('passage_id', -1); // delete all
+        if (delAllErr) return res.status(500).json({ error: delAllErr });
+      }
+    }
+
     const { data: themes, error: tErr } = await supabase.from('theme').select('theme_id, embedding_vector').not('embedding_vector', 'is', null);
     if (tErr) return res.status(500).json({ error: tErr });
+    if (!themes?.length) return res.json({ success: true, note: 'no themes with embeddings' });
 
-    // diagnostics
-    let themesCount = (themes || []).length;
+    let passageFilterIds = null;
+    if (document_id) {
+      const { data: passageRows, error: prErr } = await supabase.from('passage').select('passage_id').eq('document_id', document_id);
+      if (prErr) return res.status(500).json({ error: prErr });
+      passageFilterIds = (passageRows || []).map(r => r.passage_id);
+      if (!passageFilterIds.length) return res.json({ success: true, note: 'no passages for document after reset' });
+    }
+
     let upsertedCount = 0;
     const upsertErrors = [];
 
-    if (document_id) {
-      // process passages belonging to the document only
-      // get passage ids for the document
-      const { data: passageRows, error: prErr } = await supabase.from('passage').select('passage_id').eq('document_id', document_id);
-      if (prErr) return res.status(500).json({ error: prErr });
-      const passageIds = (passageRows || []).map(r => r.passage_id);
-      if (passageIds.length === 0) return res.json({ success: true, note: 'no passages for document' });
-
-      // fetch embeddings for these passages
-      const { data: passages, error: pErr } = await supabase.from('embedding_passage').select('passage_id, embedding_vector').in('passage_id', passageIds);
-      if (pErr) return res.status(500).json({ error: pErr });
-
-      const upserts = [];
+    async function processBatch(passages) {
+      const batchUpserts = [];
       for (const p of passages) {
-        if (!p || !p.embedding_vector) continue;
+        if (!p?.embedding_vector) continue;
+        const pVec = coerce(p.embedding_vector);
+        if (!pVec.length) continue;
+        const scores = [];
         for (const th of themes) {
-          if (!th || !th.embedding_vector) continue;
-          let score = cosine(p.embedding_vector, th.embedding_vector);
-          if (!Number.isFinite(score)) score = 0;
-          upserts.push({ passage_id: p.passage_id, theme_id: th.theme_id, score });
+          if (!th?.embedding_vector) continue;
+            const tVec = coerce(th.embedding_vector);
+            if (!tVec.length || tVec.length !== pVec.length) continue;
+            let score = cosine(pVec, tVec);
+            if (!Number.isFinite(score)) score = 0;
+            scores.push({ theme_id: th.theme_id, score });
+        }
+        scores.sort((a,b)=> b.score - a.score);
+        for (let i = 0; i < Math.min(topN, scores.length); i++) {
+          batchUpserts.push({ passage_id: p.passage_id, theme_id: scores[i].theme_id, score: scores[i].score });
         }
       }
-      for (let i = 0; i < upserts.length; i += 500) {
-        const slice = upserts.slice(i, i + 500);
-        const { error: uErr } = await supabase.from('passage_theme').upsert(slice);
-        if (uErr) {
-          console.error('upsert error', uErr);
-          upsertErrors.push(uErr);
-        } else {
-          upsertedCount += slice.length;
-        }
+      for (let i = 0; i < batchUpserts.length; i += 500) {
+        const slice = batchUpserts.slice(i, i + 500);
+        for (const r of slice) if (!Number.isFinite(r.score)) r.score = 0;
+        const { error } = await supabase.from('passage_theme').upsert(slice);
+        if (error) upsertErrors.push(error); else upsertedCount += slice.length;
       }
-
-      return res.json({ success: true, processed: passageIds.length, themes: themesCount, upserted: upsertedCount, upsertErrors });
     }
 
-    // Otherwise full dataset processing (existing behavior)
+    if (passageFilterIds) {
+      const { data: passages, error: pErr } = await supabase.from('embedding_passage').select('passage_id, embedding_vector').in('passage_id', passageFilterIds);
+      if (pErr) return res.status(500).json({ error: pErr });
+      await processBatch(passages || []);
+      return res.json({ success: true, reset, document_id, processed: passages?.length || 0, themes: themes.length, upserted: upsertedCount, upsertErrors });
+    }
+
     let offset = 0;
     while (true) {
       const { data: passages, error: pErr } = await supabase.from('embedding_passage').select('passage_id, embedding_vector').range(offset, offset + BATCH_SIZE - 1);
       if (pErr) return res.status(500).json({ error: pErr });
-      if (!passages || passages.length === 0) break;
-
-      const upserts = [];
-      for (const p of passages) {
-        if (!p || !p.embedding_vector) continue;
-        for (const th of themes) {
-          if (!th || !th.embedding_vector) continue;
-          let score = cosine(p.embedding_vector, th.embedding_vector);
-          if (!Number.isFinite(score)) score = 0;
-          upserts.push({ passage_id: p.passage_id, theme_id: th.theme_id, score });
-        }
-      }
-
-      // upsert in chunks (avoid huge single requests)
-      for (let i = 0; i < upserts.length; i += 500) {
-  const slice = upserts.slice(i, i + 500);
-  for (const row of slice) if (!Number.isFinite(row.score)) row.score = 0;
-  const { error: uErr } = await supabase.from('passage_theme').upsert(slice);
-        if (uErr) {
-          console.error('upsert error', uErr);
-          upsertErrors.push(uErr);
-        } else {
-          upsertedCount += slice.length;
-        }
-      }
-
+      if (!passages?.length) break;
+      await processBatch(passages);
       offset += BATCH_SIZE;
     }
 
-    return res.json({ success: true, themes: themesCount, upserted: upsertedCount, upsertErrors });
+    return res.json({ success: true, reset, themes: themes.length, upserted: upsertedCount, upsertErrors });
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }

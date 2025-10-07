@@ -219,25 +219,50 @@ function QueryPanel() {
   );
 }
 
+// ...existing code...
+// ...existing code...
 function RecomputeButton({ documentId }) {
   const [status, setStatus] = useState(null);
   async function run() {
-    if (!confirm('Run theme scoring for this document?')) return;
+    if (!confirm('Run theme scoring for this document? This will replace existing passage_theme and overview_theme rows for the document.')) return;
     setStatus('running');
     try {
-      const r = await fetch('/api/recompute-passage-themes', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ document_id: documentId }) });
-      const j = await r.json();
-      if (r.ok) setStatus('done');
-      else setStatus('error');
+      // Recompute passage themes
+      const pRes = await fetch('/api/recompute-passage-themes', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ reset: true, document_id: documentId, top_n: 8 })
+      });
+      const pJson = await pRes.json();
+
+      // Recompute overview themes
+      const oRes = await fetch('/api/recompute-overview-themes', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ reset: true, document_id: documentId, top_n: 8 })
+      });
+      const oJson = await oRes.json();
+
+      if (pRes.ok && oRes.ok) {
+        setStatus(`done (passage ${pJson.upserted ?? 0}, overview ${oJson.upserted ?? 0})`);
+      } else {
+        console.error('passage:', pJson, 'overview:', oJson);
+        setStatus('error');
+      }
     } catch (e) {
+      console.error(e);
       setStatus('error');
     }
-    setTimeout(()=>setStatus(null), 5000);
+    // keep status visible until user action
   }
   return (
-    <button style={{ marginLeft: 8 }} onClick={run}>{status === 'running' ? 'Running...' : status === 'done' ? 'Done' : 'Recompute'}</button>
+    <button style={{ marginLeft: 8 }} onClick={run} disabled={status === 'running'}>
+      {status === 'running' ? 'Running...' : status ? status : 'Recompute'}
+    </button>
   );
 }
+// ...existing code...
+// ...existing code...
 
 function SearchPanel() {
   const [q, setQ] = useState('');
