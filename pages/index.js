@@ -48,6 +48,7 @@ export default function Home() {
 
   const [sidebarOpen, setSidebarOpen] = useState(true);
   return (
+    
     <div style={{ display: 'flex', height: '100vh', background: 'linear-gradient(90deg, #f8fafc 0%, #e0e7ef 100%)', fontFamily: 'Segoe UI, Arial, sans-serif' }}>
       <aside style={{ width: sidebarOpen ? 340 : 56, borderRight: '1px solid #cbd5e1', background: '#f1f5f9', padding: sidebarOpen ? 24 : 8, boxShadow: '2px 0 8px #e0e7ef', display: 'flex', flexDirection: 'column', gap: 24, transition: 'width 0.2s, padding 0.2s' }}>
         <button onClick={()=>setSidebarOpen(o=>!o)} style={{ background: 'none', border: 'none', color: '#334155', fontSize: 22, fontWeight: 700, cursor: 'pointer', marginBottom: 12, alignSelf: 'flex-end' }}>{sidebarOpen ? '⏴' : '⏵'}</button>
@@ -82,6 +83,12 @@ export default function Home() {
       </aside>
 
       <main style={{ flex: 1, padding: '32px 32px 0 32px', minHeight: 0, overflow: 'auto', background: 'linear-gradient(90deg, #f8fafc 0%, #e0e7ef 100%)' }}>
+        {/* Ask Query Card at the very top */}
+        <div style={{ maxWidth: 900, margin: '0 auto', marginTop: 24 }}>
+          <DropdownCard title="Ask" open={askOpen} setOpen={setAskOpen} accent="#a3e635" icon="💬">
+            <QueryPanel />
+          </DropdownCard>
+        </div>
         <div style={{ width: '100%', height: '100%' }}>
           {/* Dual Viewer Panels */}
           <div style={{ display: 'flex', gap: 24, height: '100%', paddingTop: 24 }}>
